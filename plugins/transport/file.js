@@ -7,11 +7,14 @@
  */
 'use strict';
 
+const { AbortController } = require('node-abort-controller');
+const { default: axios } = require('axios');
 const crypto = require('crypto');
+const FormData = require( 'form-data' );
 const fs = require('fs');
 const path = require('path');
-const request = require('request');
 const sharp = require('sharp');
+const stream = require( 'stream' );
 const winston = require('winston');
 const fileType = require('file-type');
 
@@ -21,6 +24,34 @@ let handlers;
 
 const pkg = require('../../package.json');
 const USERAGENT = `LilyWhiteBot/${pkg.version} (${pkg.repository})`;
+
+class FetchStream extends stream.Transform {
+    constructor( url, config ) {
+        super();
+        this.url = url;
+        this.config = config;
+        this._doFetch();
+    }
+
+    async _doFetch() {
+        try {
+            const res = await axios.get(this.url, Object.assign({}, this.config, {
+                responseType: 'stream'
+            }));
+            res.data.pipe(this);
+        } catch ( error ) {
+            this.emit('error', error);
+        } finally {
+            this.end();
+        }
+    }
+
+    _transform(chunk, encoding, callback) {
+        this.push(chunk, encoding);
+        callback();
+    }
+}
+
 
 /**
  * 根据已有文件名生成新文件名
@@ -57,6 +88,24 @@ const convertFileType = (type) => {
     }
 };
 
+const createTimeoutAbortSignal = (timeOut) => {
+    const controller = new AbortController();
+    setTimeout(function () {
+        controller.abort('Timeout.');
+    }, timeOut);
+    return controller.signal;
+}
+
+const createFormData = (data) => {
+    const formData = new FormData();
+    for (const [name, value, filename] of data) {
+        formData.append(name, value, {
+            filename
+        });
+    }
+    return formData;
+}
+
 /**
  * 下载/获取文件内容，对文件进行格式转换（如果需要的话），然后管道出去
  * @param {*} file 
@@ -68,7 +117,7 @@ const getFileStream = (file) => {
     let fileStream;
 
     if (file.url) {
-        fileStream = request.get(file.url);
+        fileStream = new FetchStream(file.url);
     } else if (file.path) {
         fileStream = fs.createReadStream(file.path);
     } else {
@@ -117,19 +166,21 @@ const uploadToCache = async (file) => {
 const uploadToHost = (host, file) => new Promise((resolve, reject) => {
     const requestOptions = {
         timeout: servemedia.timeout || 3000,
+        signal: createTimeoutAbortSignal( servemedia.timeout ?? 30000 ),
         headers: {
-            'User-Agent': servemedia.userAgent || USERAGENT,
+            'Content-Type': 'multipart/form-data'
         },
+        responseType: 'text'
     };
 
     let name = generateFileName(file.url || file.path, file.id);
     let pendingFileStream = getFileStream(file);
-	
-	// p4: reject .exe (complaint from the site admin)
-	if (path.extname(name) === '.exe') {
-		reject('We wont upload .exe file');
+    
+    // p4: reject .exe (complaint from the site admin)
+    if (path.extname(name) === '.exe') {
+        reject('We wont upload .exe file');
         return;
-	}
+    }
 
     let buf = []
     pendingFileStream
@@ -137,35 +188,24 @@ const uploadToHost = (host, file) => new Promise((resolve, reject) => {
         .on('end', async () => {
             let pendingFile = Buffer.concat(buf);
             if (!path.extname(name)) {
-              let type = await fileType.fromBuffer(pendingFile);
-              if (type) name += '.' + type.ext;
+                let type = await fileType.fromBuffer(pendingFile);
+                if (type) name += '.' + type.ext;
             }
 
             switch (host) {
                 case 'vim-cn':
                 case 'vimcn':
                     requestOptions.url = 'https://img.vim-cn.com/';
-                    requestOptions.formData = {
-                        name: {
-                            value: pendingFile,
-                            options: {
-                                filename: name,
-                            },
-                        },
-                    };
+                    requestOptions.data = createFormData([
+                        ['name', pendingFile, name]
+                    ]);
                     break;
 
                 case 'sm.ms':
                     requestOptions.url = 'https://sm.ms/api/upload';
-                    requestOptions.json = true;
-                    requestOptions.formData = {
-                        smfile: {
-                            value: pendingFile,
-                            options: {
-                                filename: name,
-                            },
-                        },
-                    };
+                    requestOptions.data = createFormData([
+                        ['smfile', pendingFile, name]
+                    ]);
                     break;
 
                 case 'imgur':
@@ -175,30 +215,19 @@ const uploadToHost = (host, file) => new Promise((resolve, reject) => {
                         requestOptions.url = servemedia.imgur.apiUrl + '/upload';
                     }
                     requestOptions.headers.Authorization = `Client-ID ${servemedia.imgur.clientId}`;
-                    requestOptions.json = true;
-                    requestOptions.formData = {
-                        type: 'file',
-                        image: {
-                            value: pendingFile,
-                            options: {
-                                filename: name,
-                            },
-                        },
-                    };
+                    requestOptions.data = createFormData([
+                        ['type', 'file'],
+                        ['image', pendingFile, name]
+                    ]);
                     break;
 
                 case 'uguu':
                 case 'Uguu':
                     requestOptions.url = servemedia.uguuApiUrl || servemedia.UguuApiUrl; // 原配置文件以大写字母开头
-                    requestOptions.formData = {
-                        file: {
-                            value: pendingFile,
-                            options: {
-                                filename: name,
-                            }
-                        },
-                        randomname: 'true'
-                    };
+                    requestOptions.data = createFormData([
+                        ['file', pendingFile, name],
+                        ['randomname', 'true']
+                    ]);
                     break;
                     
                 case 'lsky':
@@ -206,54 +235,49 @@ const uploadToHost = (host, file) => new Promise((resolve, reject) => {
                     if (servemedia.lsky.token) {
                         requestOptions.headers.token = servemedia.lsky.token;
                     }
-                    requestOptions.formData = {
-                        image: {
-                            value: pendingFile,
-                            options: {
-                                filename: name,
-                            }
-                        },
-                    };
+                    requestOptions.data = createFormData([
+                        ['image', pendingFile, name],
+                    ]);
                     break;
                     
                 default:
                     reject(new Error('Unknown host type'));
             }
 
-            request.post(requestOptions, (error, response, body) => {
-                if (typeof callback === 'function') {
-                    callback();
-                }
-                if (!error && response.statusCode === 200) {
+            axios.postForm(requestOptions.url, requestOptions).then((response) => {
+                if (response.status === 200) {
                     if (typeof body === 'string') body = JSON.parse(body);
                     switch (host) {
                         case 'vim-cn':
                         case 'vimcn':
-                            resolve(body.trim().replace('http://', 'https://'));
+                            resolve(String(response.data).trim().replace('http://', 'https://'));
                             break;
                         case 'uguu':
                         case 'Uguu':
-                            resolve(body.trim());
+                            resolve(String(response.data).trim());
                             break;
                         case 'sm.ms':
-                            if (body && body.code !== 'success') {
-                                reject(new Error(`sm.ms return: ${body.msg}`));
+                            const sJson = JSON.parse(response.data);
+                            if (sJson && sJson.code !== 'success') {
+                                reject(new Error(`sm.ms return: ${sJson.msg}`));
                             } else {
-                                resolve(body.data.url);
+                                resolve(sJson.data.url);
                             }
                             break;
                         case 'imgur':
-                            if (body && !body.success) {
-                                reject(new Error(`Imgur return: ${body.data.error}`));
+                            const iJson = JSON.parse(response.data);
+                            if (iJson && !iJson.success) {
+                                reject(new Error(`Imgur return: ${iJson.data.error}`));
                             } else {
-                                resolve(body.data.link);
+                                resolve(iJson.data.link);
                             }
                             break;
                         case 'lsky':
-                            if (body && body.code !== 200) {
-                                reject(new Error(`Lsky return: ${body.msg}`));
+                            const lJson = JSON.parse(response.data);
+                            if (lJson && lJson.code !== 200) {
+                                reject(new Error(`Lsky return: ${lJson.msg}`));
                             } else {
-                                resolve(body.data.url);
+                                resolve(lJson.data.url);
                             }
                             break;
                     }
@@ -270,20 +294,21 @@ const uploadToHost = (host, file) => new Promise((resolve, reject) => {
 const uploadToLinx = (file) => new Promise((resolve, reject) => {
     let name = generateFileName(file.url || file.path, file.id);
 
-    pipeFileStream(file, request.put({
-        url: servemedia.linxApiUrl + name,
+    const fileStream = getFileStream(file);
+    axios.put(String( servemedia.linxApiUrl ) + name, fileStream, {
+        signal: createTimeoutAbortSignal( servemedia.timeout ?? 30000 ),
         headers: {
-            'User-Agent': servemedia.userAgent || USERAGENT,
             'Linx-Randomize': 'yes',
             'Accept': 'application/json'
-        }
-    }, (error, response, body) => {
-        if (!error && response.statusCode === 200) {
-            resolve(JSON.parse(body).direct_url);
+        },
+        responseType: 'text'
+    }).then((response) => {
+        if (response.status === 200) {
+            resolve(JSON.parse(response.data).direct_url);
         } else {
-            reject(new Error(error));
+            reject(new Error(String(response.data)));
         }
-    })).catch(err => reject(err));
+    }).catch(err => reject(err));
 });
 
 /*
@@ -344,8 +369,8 @@ const fileUploader = {
     set handlers(h) { handlers = h; },
     process: async (context) => {
         // 上传文件
-		// p4: dont bother with files from somewhere without bridges in config
-		if (context.extra.clients > 1 && context.extra.files && servemedia.type && servemedia.type !== 'none') {
+        // p4: dont bother with files from somewhere without bridges in config
+        if (context.extra.clients > 1 && context.extra.files && servemedia.type && servemedia.type !== 'none') {
             let promises = [];
             let fileCount = context.extra.files.length;
 
@@ -374,6 +399,13 @@ const fileUploader = {
 module.exports = (bridge, options) => {
     fileUploader.init(options);
     fileUploader.handlers = bridge.handlers;
+
+    axios.interceptors.request.use(function (config) {
+        config.headers = config.headers || {};
+        config.headers[ 'User-Agent' ] = servemedia.userAgent || USERAGENT;
+        // Do something before request is sent
+        return config;
+    }, undefined, {synchronous: true});
 
     bridge.addHook('bridge.send', async (msg) => {
         try {
